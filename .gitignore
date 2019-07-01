@@ -123,3 +123,7 @@ tensorflow_code
 
 # Models
 models
+log
+
+# PyCharm
+.idea
