@@ -127,3 +127,6 @@ log
 
 # PyCharm
 .idea
+
+# Data
+data
