@@ -79,7 +79,7 @@ def main():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--filter_name", default="all", type=str, required=False, help="The name of the task to train.")
-    parser.add_argument("--top_knn", default=50, type=int, required=False, help="# of top nearest neighbors to modify.")
+    parser.add_argument("--top_knn", default=200, type=int, required=False, help="# of top nearest neighbors to modify.")
     parser.add_argument("--num_shards", default=1, type=int, required=False,
                         help="# of total data splits for distributed eval")
     parser.add_argument("--shard_no", default=0, type=int, required=False, help="Distributed eval data split index.")
@@ -271,6 +271,8 @@ def main():
                             valid_all_nn_mods += 1
             print('**** {} Valid NN #{} Modifications Found!'.format(valid_nn_mods, k_rank))
         print('**** {} Total Valid NN Modifications Found!'.format(valid_all_nn_mods))
+        if len(data_hotpot_new['data']) > 100:  # Remove for real run
+            break
     with open('data/hotpot-all/test.json', 'w') as f:
         json.dump(data_hotpot_new, f)
 
