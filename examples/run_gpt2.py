@@ -6,6 +6,8 @@ import json
 import logging
 import pandas as pd
 from scipy import stats
+import spacy
+import time
 from tqdm import tqdm, trange
 
 import torch
@@ -283,13 +285,22 @@ def sample_sequence(model, length, task_name=None, start_token=None, batch_size=
             else:
                 _, prev = torch.topk(log_probs, k=1, dim=-1)
             output = torch.cat((output, prev), dim=1)
-            if (end_token is not None) and ((output == end_token).sum(1) >=
-                                            (4 if task_name == 'hotpot.q-subqs.comparison' else 3)).all():
-                break  # Decode until final token generated
+            if end_token is not None:  # Decode until final token generated
+                if task_name == 'hotpot.q-subqs.comparison':
+                    num_req_end_tokens = 4
+                elif task_name == 'hotpot.subqs-subas-q-a':
+                    num_req_end_tokens = 3
+                elif task_name in {'hotpot.q-sfs-a', 'squad.sf-q'}:
+                    num_req_end_tokens = 1
+                else:
+                    raise NotImplementedError(task_name)
+                if ((output == end_token).sum(1) >= num_req_end_tokens).all():
+                    break
     return output
 
 
 def run_model():
+    start_time = time.time()
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default='gpt2',
                         help='pretrained model name or path to local checkpoint')
@@ -375,14 +386,21 @@ def run_model():
                     example['prompt'] = q_sep + ' ' + example['prompt'] + ' ' + q_sep
                     save_data['data'].append(example)
                     examples.append(example['prompt'])
-        elif task_name in {'hotpot.subqs-subas-q-a', 'hotpot.q-sfs-a'}:
+        elif task_name in {'hotpot.subqs-subas-q-a', 'hotpot.q-sfs-a', 'squad.sf-q'}:
+            if task_name == 'squad.sf-q':
+                eos_sep = a_sep
+                eoi_sep = q_sep
+            else:
+                eos_sep = q_sep
+                eoi_sep = a_sep
+
             examples_with_answers = load_dataset(split, task_name)
             answers = []
             stats_sum = {'em': 0, 'f1': 0}
             for example_with_answer in examples_with_answers:
-                example, answer = example_with_answer.rsplit(a_sep, 1)
-                examples.append(example + a_sep)
-                answers.append(answer.strip(q_sep).strip())
+                example, answer = example_with_answer.rsplit(eoi_sep, 1)
+                examples.append(example + eoi_sep)
+                answers.append(answer.strip(eos_sep).strip())
         else:
             raise NotImplementedError('task_name {}'.format(task_name))
 
@@ -413,7 +431,7 @@ def run_model():
             out = sample_sequence(
                 model=model, length=args.length, task_name=task_name, context=context_tokens, start_token=start_token,
                 batch_size=args.batch_size, temperature=args.temperature, top_k=args.top_k, device=device,
-                end_token=enc.encode(' ' + q_sep)[0]
+                end_token=enc.encode(' ' + eos_sep)[0]
             )
             out = out[:, out_start_index:].tolist()
 
@@ -436,9 +454,9 @@ def run_model():
                         'answers': [[] for _ in range(len(save_data['data'][d]['paragraphs'][0]['context']))],
                     })
                 save_data['data'][d]['paragraphs'][0]['op'] = subqs[-1].replace(' ', '_').upper()
-            elif task_name in {'hotpot.subqs-subas-q-a', 'hotpot.q-sfs-a'}:
+            elif task_name in {'hotpot.subqs-subas-q-a', 'hotpot.q-sfs-a', 'squad.sf-q'}:
                 # EM
-                pred_answer = clean_up_tokenization_spaces(text.split(q_sep)[0].strip())
+                pred_answer = clean_up_tokenization_spaces(text.split(eos_sep)[0].strip())
                 answer = clean_up_tokenization_spaces(answers[d])
                 em = pred_answer == answer
                 stats_sum['em'] += em
@@ -463,6 +481,7 @@ def run_model():
     elif task_name in {'hotpot.subqs-subas-q-a', 'hotpot.q-sfs-a'}:
         print("Evaluation EM: {:.1%} F1: {:.1%}".format(stats_sum['em'] / len(examples),
                                                         stats_sum['f1'] / len(examples)))
+    print('Completed in {:.0f}s'.format(time.time() - start_time))
 
 
 if __name__ == '__main__':

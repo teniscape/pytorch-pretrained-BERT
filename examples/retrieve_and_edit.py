@@ -12,7 +12,9 @@ from tqdm import tqdm
 import torch
 
 from sklearn.feature_extraction.text import TfidfTransformer, TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics.pairwise import cosine_similarity, pairwise_distances_argmin_min
+from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans, AffinityPropagation, Birch, MeanShift, estimate_bandwidth
 
 format_tokenizer = OpenAIGPTTokenizer.from_pretrained('openai-gpt')
 
@@ -78,13 +80,18 @@ def main():
         Try this until all w_1, ..., w_M are exhausted.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--filter_name", default="all", type=str, required=False, help="The name of the task to train.")
-    parser.add_argument("--top_knn", default=200, type=int, required=False, help="# of top nearest neighbors to modify.")
+    parser.add_argument("--filter_name", default="bi-cond-lm", type=str, required=False, help="The name of the task to train.")
+    parser.add_argument("--top_knn", default=10, type=int, required=False, help="# of top nearest neighbors to modify.")
+    parser.add_argument("--max_mods_per_nn", default=4, type=int, required=False, help="Max # modified Qs to accept per NN Q.")
+    parser.add_argument("--seed", default=42, type=int, required=False, help="Random seed")
     parser.add_argument("--num_shards", default=1, type=int, required=False,
                         help="# of total data splits for distributed eval")
     parser.add_argument("--shard_no", default=0, type=int, required=False, help="Distributed eval data split index.")
     args = parser.parse_args()
     args.filter_name = args.filter_name.lower()
+    save_filename = 'data/hotpot-all/split=train-dev.filter_name={}.top_knn={}.max_mods_per_nn={}.num_shards={}.shard_no={}.json'.format(
+        args.filter_name, args.top_knn, args.max_mods_per_nn, args.num_shards, args.shard_no)
+    print('Saving to', save_filename)
 
     # Load HotpotQA
     qis = []
@@ -182,17 +189,13 @@ def main():
 
             prob_dists = torch.nn.functional.softmax(predictions, dim=-1)
             input_probs = prob_dists[0].gather(1, tokens_tensor[0].unsqueeze(-1))  # NB: Change for batch size > 1
-            return input_probs.mean().item()  # TODO: Compute word-level PPL. Also try TransfoXL (whichever has lower Q PPL)
+            return input_probs.mean().item()
 
     # Find and modify NNs for each HotpotQA Q
     data_hotpot_new = {'data': []}
-    for i, qi in enumerate(qis):
+    for i, qi in tqdm(enumerate(qis)):
         if (i % args.num_shards) != args.shard_no:
             continue
-        # TODO: Filter n-gram in/out substitutions by n-gram TFIDF weight OR substitution should increase TFIDF by \eps
-        # qi_word_weights = tfidf_hotpot[i][tfidf_hotpot[i].nonzero()].tolist()[0]
-        # qi_bow = tfidf.inverse_transform(tfidf_hotpot[i])[0].tolist()
-        # qi_tokens_sorted_by_weight = np.array(sorted(zip(qi_word_weights, qi_bow), reverse=True))[:, 1]
 
         qi_words = word_tokenizer(qi)
         qi_unwords = word_untokenizer(qi_words)
@@ -209,7 +212,7 @@ def main():
             }],
             'title': ''
         })
-        valid_all_nn_mods = 0
+
         for k_rank in range(args.top_knn):
             k = sorted_q_idxs_squad[k_rank]
             qk = qks[k]
@@ -228,14 +231,16 @@ def main():
                 qk_prob = 1.0
             else:
                 raise NotImplementedError('filter_name {}'.format(args.filter_name))
-            print('= NN #{}: {} ({:.0%}) (TFIDF: {:.2f})'.format(k_rank + 1, qk_unwords.capitalize(), qk_prob,
-                                                                 tfidf_cosine[i, k]))
+            print('= NN #{}: {} ({:.4%}) (TFIDF: {:.2f})'.format(k_rank + 1, qk_unwords.capitalize(), qk_prob,
+                tfidf_cosine[i, k]))
 
             if args.filter_name == 'all':
                 continue
 
+            start_time = time.time()
+            # qkp_infos = set([])  # Avoid duplicates
             max_ngram_size = 3
-            valid_nn_mods = 0
+            all_qkp_unwords = set([])
             for qi_ngram_size in range(1, max_ngram_size + 1):
                 for qk_ngram_size in range(1, max_ngram_size + 1):  # range(max_ngram_size + 1) to include insertions
                     for qi_start_pos in range(len(qi_words) - qi_ngram_size):  # Excludes '?'
@@ -244,36 +249,137 @@ def main():
                                          qi_words[qi_start_pos: qi_start_pos + qi_ngram_size] + \
                                          qk_words[qk_start_pos + qk_ngram_size:]
                             qkp_unwords = word_untokenizer(qkp_words)
+                            all_qkp_unwords.add(qkp_unwords)
+            print('= NN #{}: Modifying NNs: {:.2f}s)'.format(k_rank + 1, time.time() - start_time))
+            start_time = time.time()
 
-                            if 'bi-cond-lm' in args.filter_name:
-                                qkp_prob1 = eval_prob(qi_unwords + ' ' + qkp_unwords)
-                                qkp_prob2 = eval_prob(qkp_unwords + ' ' + qi_unwords)
-                                qkp_prob = (qkp_prob1 + qkp_prob2) / 2.
-                                if (qkp_prob1 < qk_prob1) or (qkp_prob2 < qk_prob2):
-                                    continue
-                            elif 'cond-lm' in args.filter_name:
-                                qkp_prob = eval_prob(qi_unwords + ' ' + qkp_unwords)
-                            elif 'lm' in args.filter_name:
-                                qkp_prob = eval_prob(qkp_unwords)
-                            else:  # No filtering
-                                qkp_prob = 1.0
+            all_qkp_unwords = list(all_qkp_unwords)
+            all_qkp_tfidf = tfidf.transform(all_qkp_unwords)
+            all_qi2qkp_tfidf_cosine = cosine_similarity(tfidf_hotpot[i], all_qkp_tfidf)[0]
+            all_qk2qkp_tfidf_cosine = cosine_similarity(tfidf_squad[k], all_qkp_tfidf)[0]
+            qkp_infos = list(zip(all_qkp_unwords, all_qi2qkp_tfidf_cosine, all_qk2qkp_tfidf_cosine))
+            print('= NN #{}: Calculating TFIDFs: {:.2f}s)'.format(k_rank + 1, time.time() - start_time))
+            start_time = time.time()
 
-                            if qkp_prob < qk_prob:
-                                continue
+            # qkp_aug_infos = []
+            max_lm_evals = 32 * args.max_mods_per_nn
+            top_qkp_infos = sorted(qkp_infos, key=lambda x: x[1]-x[2], reverse=True)[:max_lm_evals]
+            num_lm_approved_qkps = 0
+            for qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine in top_qkp_infos:
+                if 'bi-cond-lm' in args.filter_name:
+                    qkp_prob1 = eval_prob(qi_unwords + ' ' + qkp_unwords)
+                    if qkp_prob1 < qk_prob1:
+                        continue
+                    qkp_prob2 = eval_prob(qkp_unwords + ' ' + qi_unwords)
+                    if qkp_prob2 < qk_prob2:
+                        continue
+                    qkp_prob = (qkp_prob1 + qkp_prob2) / 2.
+                elif 'cond-lm' in args.filter_name:
+                    qkp_prob = eval_prob(qi_unwords + ' ' + qkp_unwords)
+                elif 'lm' in args.filter_name:
+                    qkp_prob = eval_prob(qkp_unwords)
+                else:  # No filtering
+                    qkp_prob = 1.0
 
-                            print('== {} ({:.0%})'.format(qkp_unwords.capitalize(), qkp_prob))
-                            data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
-                                'question': qkp_unwords,
-                                'answers': [[] for _ in range(len(cis[i]))],
-                                'id': idis[i] + '-' + str(valid_all_nn_mods)
-                            })
-                            valid_nn_mods += 1
-                            valid_all_nn_mods += 1
-            print('**** {} Valid NN #{} Modifications Found!'.format(valid_nn_mods, k_rank))
-        print('**** {} Total Valid NN Modifications Found!'.format(valid_all_nn_mods))
-        if len(data_hotpot_new['data']) > 100:  # Remove for real run
-            break
-    with open('data/hotpot-all/test.json', 'w') as f:
+                if qkp_prob < qk_prob:
+                    continue
+
+                print('=== TFIDF-qi: {:.2f}, TFIDF-qk: {:.2f}, {:.4%}, {}'.format(
+                    qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob, qkp_unwords.capitalize()))
+                data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
+                    'question': qkp_unwords,
+                    'answers': [[] for _ in range(len(cis[i]))],
+                    'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas']))
+                })
+                num_lm_approved_qkps += 1
+                if num_lm_approved_qkps >= args.max_mods_per_nn:
+                    break
+
+                # qkp_aug_infos.append((qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob))
+            print('**** {} Valid NN #{} Modifications Found! (LM Evals: {:.2f}s)'.format(
+                num_lm_approved_qkps, k_rank + 1, time.time() - start_time))
+
+            # if len(qkp_aug_infos) == 0:
+            #     continue
+            #
+            # cand_qkp_unwords, cand_qi2qkp_tfidf_cosine, cand_qk2qkp_tfidf_cosine, cand_qkp_prob = zip(*qkp_aug_infos)
+            # n_clusters = args.max_mods_per_nn ** 2
+            # if len(qkp_aug_infos) > n_clusters:  # Cluster valid NN modifications to reduce number of modified examples
+            #     tfidf_valid_nn_mods = tfidf.transform(cand_qkp_unwords)
+            #     for algo in [None, 'KMeans: TFIDF-weighted', 'GaussianMixture', 'AffinityPropagation', 'Birch']:
+            #         start_time = time.time()
+            #         if algo == 'KMeans':
+            #             cluster = KMeans(n_clusters=n_clusters, random_state=args.seed)
+            #             cluster.fit_predict(tfidf_valid_nn_mods, sample_weight=None)
+            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
+            #         elif algo == 'KMeans: LM-weighted':  # Very similar to KMeans
+            #             cluster = KMeans(n_clusters=n_clusters, random_state=args.seed)
+            #             cluster.fit_predict(tfidf_valid_nn_mods, sample_weight=cand_qkp_prob)
+            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
+            #         elif algo == 'KMeans: TFIDF-weighted':  # Very similar to KMeans
+            #             cluster = KMeans(n_clusters=n_clusters, random_state=args.seed)
+            #             cluster.fit_predict(tfidf_valid_nn_mods, sample_weight=cand_qi2qkp_tfidf_cosine)
+            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
+            #         elif algo == 'GaussianMixture':
+            #             cluster = GaussianMixture(n_components=n_clusters, random_state=args.seed, covariance_type='diag')
+            #             cluster.fit_predict(tfidf_valid_nn_mods.toarray())
+            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.means_, tfidf_valid_nn_mods)
+            #         elif algo == 'AffinityPropagation':  # Variable cluster #
+            #             cluster = AffinityPropagation()
+            #             cluster.fit_predict(tfidf_valid_nn_mods)
+            #             centroid_nn_indices = cluster.cluster_centers_indices_
+            #         elif algo == 'AffinityPropagation: LM-weighted':  # Variable cluster # (many)
+            #             cluster = AffinityPropagation(preference=cand_qkp_prob)
+            #             cluster.fit_predict(tfidf_valid_nn_mods)
+            #             centroid_nn_indices = cluster.cluster_centers_indices_
+            #         elif algo == 'AffinityPropagation: TFIDF-weighted':  # Variable cluster # (many)
+            #             cluster = AffinityPropagation(preference=cand_qi2qkp_tfidf_cosine)
+            #             cluster.fit_predict(tfidf_valid_nn_mods)
+            #             centroid_nn_indices = cluster.cluster_centers_indices_
+            #         elif algo == 'Birch':  # Variable # of clusters
+            #             cluster = Birch(n_clusters=args.max_mods_per_nn, threshold=0.3)
+            #             cluster.fit_predict(tfidf_valid_nn_mods)
+            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.subcluster_centers_, tfidf_valid_nn_mods)
+            #         elif algo == 'MeanShift':  # Only 1 cluster, Takes long
+            #             estimate_bandwidth_time = time.time()
+            #             bandwidth = estimate_bandwidth(tfidf_valid_nn_mods.toarray(), n_jobs=-1)
+            #             print('==== bandwidth {} ({:.0f}s)'.format(bandwidth, time.time() - estimate_bandwidth_time))
+            #             cluster = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+            #             cluster.fit_predict(tfidf_valid_nn_mods.toarray())
+            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
+            #         elif algo is None:
+            #             centroid_nn_indices = np.array(range(len(qkp_aug_infos)))
+            #         else:
+            #             raise NotImplementedError(algo)
+            #         print('=== ({:.0f}s) ({} NNs) {}'.format(time.time() - start_time, centroid_nn_indices.size, algo))
+            #
+            #         centroid_qkp_aug_infos = [qkp_aug_infos[c] for c in centroid_nn_indices]
+            #         for qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob in sorted(
+            #                 centroid_qkp_aug_infos, key=lambda x: x[2]-x[3], reverse=True)[:n_clusters]:
+            #             print('=== TFIDF-qk: {:.2f}, TFIDF-qi: {:.2f}, {:.4%}, {}'.format(
+            #                 qk2qkp_tfidf_cosine, qi2qkp_tfidf_cosine, qkp_prob, qkp_unwords.capitalize()))
+            #             data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
+            #                 'question': qkp_unwords,
+            #                 'answers': [[] for _ in range(len(cis[i]))],
+            #                 'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas']))
+            #             })
+            #         print('TFIDFi {} -> TFIDFi-TFIDFk {} -> LM {} -> Cluster {} -> Final {}'.format(
+            #             len(qkp_infos), len(top_qkp_infos), len(qkp_aug_infos), len(centroid_qkp_aug_infos), args.max_mods_per_nn))
+            #     else:
+            #         centroid_qkp_aug_infos = qkp_aug_infos
+            #         for qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob in sorted(
+            #                 centroid_qkp_aug_infos, key=lambda x: x[2]-x[3], reverse=True):
+            #             print('=== TFIDF-qk: {:.2f}, TFIDF-qi: {:.2f}, {:.4%}, {}'.format(
+            #                 qk2qkp_tfidf_cosine, qi2qkp_tfidf_cosine, qkp_prob, qkp_unwords.capitalize()))
+            #             data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
+            #                 'question': qkp_unwords,
+            #                 'answers': [[] for _ in range(len(cis[i]))],
+            #                 'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas']))
+            #             })
+            #         print('TFIDFi {} -> TFIDFi-TFIDFk {} -> LM {} -> Final {}'.format(
+            #             len(qkp_infos), len(top_qkp_infos), len(qkp_aug_infos), args.max_mods_per_nn))
+
+    with open(save_filename, 'w') as f:
         json.dump(data_hotpot_new, f)
 
     return
