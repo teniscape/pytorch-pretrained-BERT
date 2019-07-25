@@ -8,6 +8,7 @@ import os
 import pickle
 from pytorch_pretrained_bert import (GPT2Tokenizer, GPT2LMHeadModel, GPT2DoubleHeadsModel,
                                      OpenAIGPTTokenizer, OpenAIGPTLMHeadModel, OpenAIGPTDoubleHeadsModel)
+import struct
 from tqdm import tqdm
 import torch
 
@@ -17,6 +18,56 @@ from sklearn.mixture import GaussianMixture
 from sklearn.cluster import KMeans, AffinityPropagation, Birch, MeanShift, estimate_bandwidth
 
 format_tokenizer = OpenAIGPTTokenizer.from_pretrained('openai-gpt')
+
+
+def read_npy_chunk(filename, start_row, num_rows):
+    """
+    Copyright (c) 2012 by David Warde-Farley
+
+    Reads a partial array (contiguous chunk along the first
+    axis) from an NPY file.
+
+    Parameters
+    ----------
+    filename : str
+        Name/path of the file from which to read.
+    start_row : int
+        The first row of the chunk you wish to read. Must be
+        less than the number of rows (elements along the first
+        axis) in the file.
+    num_rows : int
+        The number of rows you wish to read. The total of
+        `start_row + num_rows` must be less than the number of
+        rows (elements along the first axis) in the file.
+
+    Returns
+    -------
+    out : ndarray
+        Array with `out.shape[0] == num_rows`, equivalent to
+        `arr[start_row:start_row + num_rows]` if `arr` were
+        the entire array (note that the entire array is never
+        loaded into memory by this function).
+    """
+    assert start_row >= 0 and num_rows > 0
+    with open(filename, 'rb') as fhandle:
+        major, minor = np.lib.format.read_magic(fhandle)
+        shape, fortran, dtype = np.lib.format.read_array_header_1_0(fhandle)
+        assert not fortran, "Fortran order arrays not supported"
+        # Make sure the offsets aren't invalid.
+        assert start_row < shape[0], (
+            'start_row is beyond end of file'
+        )
+        assert start_row + num_rows <= shape[0], (
+            'start_row + num_rows > shape[0]'
+        )
+        # Get the number of elements in one 'row' by taking
+        # a product over all other dimensions.
+        row_size = np.prod(shape[1:])
+        start_byte = start_row * row_size * dtype.itemsize
+        fhandle.seek(start_byte, 1)
+        n_items = row_size * num_rows
+        flat = np.fromfile(fhandle, count=n_items, dtype=dtype)
+        return flat.reshape((-1,) + shape[1:])
 
 
 def cosine_similarity_chunk(i, X, Y, num_chunks):
@@ -157,8 +208,13 @@ def main():
     # HotpotQA-SQuAD TFIDF cosine distances
     start_time = time.time()
     tfidf_cosine_filepath = 'data/hotpot-all/tfidf_cosine.npy'
+    start_row_index = (args.shard_no * len(qis)) // args.num_shards
+    end_row_index = ((args.shard_no + 1) * len(qis)) // args.num_shards
     if os.path.exists(tfidf_cosine_filepath):
-        tfidf_cosine = np.load(tfidf_cosine_filepath)
+        # tfidf_cosine = np.load(tfidf_cosine_filepath)
+        tfidf_cosine = np.zeros((len(qis), len(qks)))
+        tfidf_cosine[start_row_index: end_row_index] = read_npy_chunk(
+            tfidf_cosine_filepath, start_row_index, end_row_index - start_row_index)
     else:
         print('Cosine(Hotpot Qs, SQuAD Qs)...')
         num_chunks = 240
@@ -194,8 +250,8 @@ def main():
     # Find and modify NNs for each HotpotQA Q
     data_hotpot_new = {'data': []}
     for i, qi in tqdm(enumerate(qis)):
-        if (i % args.num_shards) != args.shard_no:
-            continue
+        if (i < start_row_index) or (i >= end_row_index):
+            continue  # Handle by different shard_no
 
         qi_words = word_tokenizer(qi)
         qi_unwords = word_untokenizer(qi_words)
@@ -214,6 +270,7 @@ def main():
         })
 
         for k_rank in range(args.top_knn):
+            start_time = time.time()
             k = sorted_q_idxs_squad[k_rank]
             qk = qks[k]
             data_hotpot_new['data'][-1]['paragraphs'][0]['nns'].append(qk)
@@ -231,13 +288,10 @@ def main():
                 qk_prob = 1.0
             else:
                 raise NotImplementedError('filter_name {}'.format(args.filter_name))
-            print('= NN #{}: {} ({:.4%}) (TFIDF: {:.2f})'.format(k_rank + 1, qk_unwords.capitalize(), qk_prob,
-                tfidf_cosine[i, k]))
 
             if args.filter_name == 'all':
                 continue
 
-            start_time = time.time()
             # qkp_infos = set([])  # Avoid duplicates
             max_ngram_size = 3
             all_qkp_unwords = set([])
@@ -250,18 +304,16 @@ def main():
                                          qk_words[qk_start_pos + qk_ngram_size:]
                             qkp_unwords = word_untokenizer(qkp_words)
                             all_qkp_unwords.add(qkp_unwords)
-            print('= NN #{}: Modifying NNs: {:.2f}s)'.format(k_rank + 1, time.time() - start_time))
-            start_time = time.time()
 
             all_qkp_unwords = list(all_qkp_unwords)
             all_qkp_tfidf = tfidf.transform(all_qkp_unwords)
             all_qi2qkp_tfidf_cosine = cosine_similarity(tfidf_hotpot[i], all_qkp_tfidf)[0]
             all_qk2qkp_tfidf_cosine = cosine_similarity(tfidf_squad[k], all_qkp_tfidf)[0]
             qkp_infos = list(zip(all_qkp_unwords, all_qi2qkp_tfidf_cosine, all_qk2qkp_tfidf_cosine))
-            print('= NN #{}: Calculating TFIDFs: {:.2f}s)'.format(k_rank + 1, time.time() - start_time))
+            print('= NN #{}: {} ({:.4%}) (TFIDF: {:.2f}) (Calc TFIDFs: {:.2f}s)'.format(
+                k_rank + 1, qk_unwords.capitalize(), qk_prob, tfidf_cosine[i, k], time.time() - start_time))
             start_time = time.time()
 
-            # qkp_aug_infos = []
             max_lm_evals = 32 * args.max_mods_per_nn
             top_qkp_infos = sorted(qkp_infos, key=lambda x: x[1]-x[2], reverse=True)[:max_lm_evals]
             num_lm_approved_qkps = 0
@@ -295,89 +347,8 @@ def main():
                 if num_lm_approved_qkps >= args.max_mods_per_nn:
                     break
 
-                # qkp_aug_infos.append((qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob))
-            print('**** {} Valid NN #{} Modifications Found! (LM Evals: {:.2f}s)'.format(
-                num_lm_approved_qkps, k_rank + 1, time.time() - start_time))
-
-            # if len(qkp_aug_infos) == 0:
-            #     continue
-            #
-            # cand_qkp_unwords, cand_qi2qkp_tfidf_cosine, cand_qk2qkp_tfidf_cosine, cand_qkp_prob = zip(*qkp_aug_infos)
-            # n_clusters = args.max_mods_per_nn ** 2
-            # if len(qkp_aug_infos) > n_clusters:  # Cluster valid NN modifications to reduce number of modified examples
-            #     tfidf_valid_nn_mods = tfidf.transform(cand_qkp_unwords)
-            #     for algo in [None, 'KMeans: TFIDF-weighted', 'GaussianMixture', 'AffinityPropagation', 'Birch']:
-            #         start_time = time.time()
-            #         if algo == 'KMeans':
-            #             cluster = KMeans(n_clusters=n_clusters, random_state=args.seed)
-            #             cluster.fit_predict(tfidf_valid_nn_mods, sample_weight=None)
-            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
-            #         elif algo == 'KMeans: LM-weighted':  # Very similar to KMeans
-            #             cluster = KMeans(n_clusters=n_clusters, random_state=args.seed)
-            #             cluster.fit_predict(tfidf_valid_nn_mods, sample_weight=cand_qkp_prob)
-            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
-            #         elif algo == 'KMeans: TFIDF-weighted':  # Very similar to KMeans
-            #             cluster = KMeans(n_clusters=n_clusters, random_state=args.seed)
-            #             cluster.fit_predict(tfidf_valid_nn_mods, sample_weight=cand_qi2qkp_tfidf_cosine)
-            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
-            #         elif algo == 'GaussianMixture':
-            #             cluster = GaussianMixture(n_components=n_clusters, random_state=args.seed, covariance_type='diag')
-            #             cluster.fit_predict(tfidf_valid_nn_mods.toarray())
-            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.means_, tfidf_valid_nn_mods)
-            #         elif algo == 'AffinityPropagation':  # Variable cluster #
-            #             cluster = AffinityPropagation()
-            #             cluster.fit_predict(tfidf_valid_nn_mods)
-            #             centroid_nn_indices = cluster.cluster_centers_indices_
-            #         elif algo == 'AffinityPropagation: LM-weighted':  # Variable cluster # (many)
-            #             cluster = AffinityPropagation(preference=cand_qkp_prob)
-            #             cluster.fit_predict(tfidf_valid_nn_mods)
-            #             centroid_nn_indices = cluster.cluster_centers_indices_
-            #         elif algo == 'AffinityPropagation: TFIDF-weighted':  # Variable cluster # (many)
-            #             cluster = AffinityPropagation(preference=cand_qi2qkp_tfidf_cosine)
-            #             cluster.fit_predict(tfidf_valid_nn_mods)
-            #             centroid_nn_indices = cluster.cluster_centers_indices_
-            #         elif algo == 'Birch':  # Variable # of clusters
-            #             cluster = Birch(n_clusters=args.max_mods_per_nn, threshold=0.3)
-            #             cluster.fit_predict(tfidf_valid_nn_mods)
-            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.subcluster_centers_, tfidf_valid_nn_mods)
-            #         elif algo == 'MeanShift':  # Only 1 cluster, Takes long
-            #             estimate_bandwidth_time = time.time()
-            #             bandwidth = estimate_bandwidth(tfidf_valid_nn_mods.toarray(), n_jobs=-1)
-            #             print('==== bandwidth {} ({:.0f}s)'.format(bandwidth, time.time() - estimate_bandwidth_time))
-            #             cluster = MeanShift(bandwidth=bandwidth, bin_seeding=True)
-            #             cluster.fit_predict(tfidf_valid_nn_mods.toarray())
-            #             centroid_nn_indices, _ = pairwise_distances_argmin_min(cluster.cluster_centers_, tfidf_valid_nn_mods)
-            #         elif algo is None:
-            #             centroid_nn_indices = np.array(range(len(qkp_aug_infos)))
-            #         else:
-            #             raise NotImplementedError(algo)
-            #         print('=== ({:.0f}s) ({} NNs) {}'.format(time.time() - start_time, centroid_nn_indices.size, algo))
-            #
-            #         centroid_qkp_aug_infos = [qkp_aug_infos[c] for c in centroid_nn_indices]
-            #         for qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob in sorted(
-            #                 centroid_qkp_aug_infos, key=lambda x: x[2]-x[3], reverse=True)[:n_clusters]:
-            #             print('=== TFIDF-qk: {:.2f}, TFIDF-qi: {:.2f}, {:.4%}, {}'.format(
-            #                 qk2qkp_tfidf_cosine, qi2qkp_tfidf_cosine, qkp_prob, qkp_unwords.capitalize()))
-            #             data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
-            #                 'question': qkp_unwords,
-            #                 'answers': [[] for _ in range(len(cis[i]))],
-            #                 'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas']))
-            #             })
-            #         print('TFIDFi {} -> TFIDFi-TFIDFk {} -> LM {} -> Cluster {} -> Final {}'.format(
-            #             len(qkp_infos), len(top_qkp_infos), len(qkp_aug_infos), len(centroid_qkp_aug_infos), args.max_mods_per_nn))
-            #     else:
-            #         centroid_qkp_aug_infos = qkp_aug_infos
-            #         for qkp_unwords, qi2qkp_tfidf_cosine, qk2qkp_tfidf_cosine, qkp_prob in sorted(
-            #                 centroid_qkp_aug_infos, key=lambda x: x[2]-x[3], reverse=True):
-            #             print('=== TFIDF-qk: {:.2f}, TFIDF-qi: {:.2f}, {:.4%}, {}'.format(
-            #                 qk2qkp_tfidf_cosine, qi2qkp_tfidf_cosine, qkp_prob, qkp_unwords.capitalize()))
-            #             data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
-            #                 'question': qkp_unwords,
-            #                 'answers': [[] for _ in range(len(cis[i]))],
-            #                 'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas']))
-            #             })
-            #         print('TFIDFi {} -> TFIDFi-TFIDFk {} -> LM {} -> Final {}'.format(
-            #             len(qkp_infos), len(top_qkp_infos), len(qkp_aug_infos), args.max_mods_per_nn))
+            print('= NN #{}: {} LM-approved mods found ({:.2f}s)'.format(
+                k_rank + 1, num_lm_approved_qkps, time.time() - start_time))
 
     with open(save_filename, 'w') as f:
         json.dump(data_hotpot_new, f)
