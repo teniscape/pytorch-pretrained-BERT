@@ -232,7 +232,9 @@ def main():
         else:  # Unconditional LM
             model, model_tokenizer, model_args = load_model(
                 'checkpoint/tn=squad-questions-lm.mn=openai-gpt.tbs=64.lr=6.25e-5')
-        model.eval().to('cuda')
+        model.half()
+        model.to('cuda')
+        model.eval()
 
         def eval_prob(text):
             indexed_tokens = model_tokenizer.encode(text)
@@ -303,8 +305,11 @@ def main():
                                          qi_words[qi_start_pos: qi_start_pos + qi_ngram_size] + \
                                          qk_words[qk_start_pos + qk_ngram_size:]
                             qkp_unwords = word_untokenizer(qkp_words)
-                            all_qkp_unwords.add(qkp_unwords)
+                            if len(qkp_unwords) > 0:
+                                all_qkp_unwords.add(qkp_unwords)
 
+            if len(all_qkp_unwords) == 0:
+                continue
             all_qkp_unwords = list(all_qkp_unwords)
             all_qkp_tfidf = tfidf.transform(all_qkp_unwords)
             all_qi2qkp_tfidf_cosine = cosine_similarity(tfidf_hotpot[i], all_qkp_tfidf)[0]
@@ -341,7 +346,9 @@ def main():
                 data_hotpot_new['data'][-1]['paragraphs'][0]['qas'].append({
                     'question': qkp_unwords,
                     'answers': [[] for _ in range(len(cis[i]))],
-                    'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas']))
+                    'id': idis[i] + '-' + str(len(data_hotpot_new['data'][-1]['paragraphs'][0]['qas'])),
+                    'k_rank': k_rank,
+                    'mod_rank': num_lm_approved_qkps,
                 })
                 num_lm_approved_qkps += 1
                 if num_lm_approved_qkps >= args.max_mods_per_nn:

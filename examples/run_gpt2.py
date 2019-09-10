@@ -316,6 +316,7 @@ def run_model():
     parser.add_argument("--num_shards", default=1, type=int, required=False,
                         help="# of total data splits for distributed eval")
     parser.add_argument("--shard_no", default=0, type=int, required=False, help="Distributed eval data split index.")
+    parser.add_argument("--no_task", action='store_true', help="No decoding task (use interactive).")
     args = parser.parse_args()
     print(args)
 
@@ -332,7 +333,7 @@ def run_model():
     model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
     args_path = os.path.join(args.model_name_or_path, 'training_args.bin')
     model_args = torch.load(args_path) if os.path.exists(args_path) else None
-    model.half()  # fp16
+    model.half()
     model.to(device)
     model.eval()
 
@@ -345,7 +346,7 @@ def run_model():
     if ('squad' in args.model_name_or_path) or ('hotpot' in args.model_name_or_path):
         format_tokenizer = OpenAIGPTTokenizer.from_pretrained('openai-gpt')
 
-    task_name = None if model_args is None else model_args.task_name
+    task_name = None if ((model_args is None) or args.no_task) else model_args.task_name
     if task_name is not None:
         # Backward-compatibility for task_name
         if task_name == 'hotpotqa-recomposition-supporting-fact':
@@ -431,7 +432,7 @@ def run_model():
             out = sample_sequence(
                 model=model, length=args.length, task_name=task_name, context=context_tokens, start_token=start_token,
                 batch_size=args.batch_size, temperature=args.temperature, top_k=args.top_k, device=device,
-                end_token=enc.encode(' ' + eos_sep)[0]
+                end_token=None if task_name is None else enc.encode(' ' + eos_sep)[0]
             )
             out = out[:, out_start_index:].tolist()
 
